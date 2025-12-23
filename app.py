@@ -11,22 +11,23 @@ from typing import Optional, Tuple, List
 
 import streamlit as st
 
+
 # ============================================================
-# ✅ Page config (must be first Streamlit command)
+# ✅ PAGE CONFIG
 # ============================================================
 st.set_page_config(page_title="EDD MIS Chatbot", layout="wide")
 
 
 # ============================================================
-# ✅ Lazy dependency loader (prevents "Oh no" on missing libs)
+# ✅ LAZY IMPORTS (prevent "Oh no" on missing deps)
 # ============================================================
 pd = None
 np = None
+
 PatternFill = Font = Alignment = Border = Side = ColorScaleRule = None
 
 
 def _ensure_deps() -> bool:
-    """Import heavy deps safely. If fails, show error in UI (no crash)."""
     global pd, np, PatternFill, Font, Alignment, Border, Side, ColorScaleRule
     if pd is not None and np is not None:
         return True
@@ -49,7 +50,62 @@ def _ensure_deps() -> bool:
 
 
 # ============================================================
-# ✅ FAST SUMMARY BUILDERS (OPTIMIZED)
+# ✅ REQUIRED COLUMNS (to reduce RAM/Time)
+# ============================================================
+REQUIRED_COLS = [
+    "EDD_Date",
+    "PICKUP_CHLN_DATE",
+    "TAT_DAYS",
+    "Reached At Destination",
+    "DLY_Date",
+    "BKG_Zone",
+    "TPTR_Mode",
+    "CN_Current_Status",
+    "BUSINESS_TYPE",
+    "NDR_Remark",
+]
+
+
+def _read_required_columns_excel(file_path: str, sheet_name: str) -> "pd.DataFrame":
+    """
+    Reads ONLY the required columns from the Excel sheet (huge speed + RAM improvement).
+    Works even if headers have extra spaces (we strip headers using openpyxl first).
+    """
+    if not _ensure_deps():
+        st.stop()
+
+    from openpyxl import load_workbook
+
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        wb.close()
+        raise ValueError(f"Sheet '{sheet_name}' not found. Available: {wb.sheetnames}")
+
+    ws = wb[sheet_name]
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    header = [("" if v is None else str(v)).strip() for v in header_row]
+    wb.close()
+
+    idx_map = {}
+    for i, h in enumerate(header):
+        if h:  # ignore blanks
+            idx_map[h] = i
+
+    missing = [c for c in REQUIRED_COLS if c not in idx_map]
+    if missing:
+        raise ValueError(f"Missing columns in Excel: {missing}")
+
+    # Pandas usecols by integer positions (0-based)
+    usecols = sorted({idx_map[c] for c in REQUIRED_COLS})
+
+    df = pd.read_excel(file_path, sheet_name=sheet_name, usecols=usecols, engine="openpyxl")
+    df.columns = df.columns.astype(str).str.strip()
+
+    return df
+
+
+# ============================================================
+# ✅ OPTIMIZED SUMMARY BUILD (FAST)
 # ============================================================
 def _format_percent_count(pct: float, cnt: int) -> str:
     try:
@@ -65,17 +121,24 @@ def _format_percent_count(pct: float, cnt: int) -> str:
     return f"{pct_f}% ({cnt_i})"
 
 
-def _build_summary_fast(df):
+def _build_summary_fast(df: "pd.DataFrame") -> "pd.DataFrame":
     """
-    Builds the same summary as your original code but MUCH faster.
-    Avoids nested df[(...)] filters; uses groupby/unstack cubes.
+    Same output as your original summary but MUCH faster.
+    Uses groupby/unstack cubes (no nested filtering loops).
     """
     if not _ensure_deps():
         st.stop()
 
-    # Keep same week ordering as original:
     weekly_total_df = df.groupby("Week_Label").size().reset_index(name="Picked Volume")
-    weeks = weekly_total_df["Week_Label"].tolist()
+
+    # Numeric sort for weeks (W-1, W-2, ... W-52)
+    def wk_key(x: str) -> int:
+        try:
+            return int(str(x).split("-")[1])
+        except Exception:
+            return 999
+
+    weeks = sorted(weekly_total_df["Week_Label"].tolist(), key=wk_key)
 
     weekly_total = (
         weekly_total_df.set_index("Week_Label")["Picked Volume"]
@@ -84,35 +147,36 @@ def _build_summary_fast(df):
         .astype(int)
     )
 
-    zones = sorted(df["BKG_Zone"].dropna().unique())
-    all_modes = sorted(df["TPTR_Mode"].dropna().unique())
-    all_statuses = sorted(df["CN_Current_Status"].dropna().unique())
-    all_business_types = sorted(df["BUSINESS_TYPE"].dropna().unique())
+    # Convert group cols to category for speed + memory
+    for col in ["BKG_Zone", "TPTR_Mode", "CN_Current_Status", "BUSINESS_TYPE", "Week_Label"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
 
-    # zone x week
+    zones = sorted(df["BKG_Zone"].dropna().unique().tolist())
+    all_modes = sorted(df["TPTR_Mode"].dropna().unique().tolist())
+    all_statuses = sorted(df["CN_Current_Status"].dropna().unique().tolist())
+    all_business_types = sorted(df["BUSINESS_TYPE"].dropna().unique().tolist())
+
     zone_counts = (
         df.groupby(["BKG_Zone", "Week_Label"]).size().unstack(fill_value=0)
-        .reindex(index=zones, columns=weeks, fill_value=0)
-        .astype(int)
+        .reindex(index=zones, columns=weeks, fill_value=0).astype(int)
     )
 
-    # zone x business_type x week
     bt_counts = df.groupby(["BKG_Zone", "BUSINESS_TYPE", "Week_Label"]).size().unstack(fill_value=0)
     bt_counts = bt_counts.reindex(
         pd.MultiIndex.from_product([zones, all_business_types], names=["BKG_Zone", "BUSINESS_TYPE"]),
         fill_value=0,
     ).reindex(columns=weeks, fill_value=0).astype(int)
 
-    # zone x mode x week
     mode_counts = df.groupby(["BKG_Zone", "TPTR_Mode", "Week_Label"]).size().unstack(fill_value=0)
     mode_counts = mode_counts.reindex(
         pd.MultiIndex.from_product([zones, all_modes], names=["BKG_Zone", "TPTR_Mode"]),
         fill_value=0,
     ).reindex(columns=weeks, fill_value=0).astype(int)
 
-    # OTA cube
+    # OTA / OTD are boolean columns now
     ota_counts = (
-        df[df["ON_TIME_ARRIVAL"] == "Yes"]
+        df[df["ON_TIME_ARRIVAL"]]
         .groupby(["BKG_Zone", "TPTR_Mode", "Week_Label"]).size().unstack(fill_value=0)
     )
     ota_counts = ota_counts.reindex(
@@ -120,9 +184,8 @@ def _build_summary_fast(df):
         fill_value=0,
     ).reindex(columns=weeks, fill_value=0).astype(int)
 
-    # OTD cube
     otd_counts = (
-        df[df["ON_TIME_DELIVERY"] == "Yes"]
+        df[df["ON_TIME_DELIVERY"]]
         .groupby(["BKG_Zone", "TPTR_Mode", "Week_Label"]).size().unstack(fill_value=0)
     )
     otd_counts = otd_counts.reindex(
@@ -130,16 +193,14 @@ def _build_summary_fast(df):
         fill_value=0,
     ).reindex(columns=weeks, fill_value=0).astype(int)
 
-    # NDR not available cube
+    # NDR rule
     ndr_blank = df["NDR_Remark"].isna() | (df["NDR_Remark"].astype(str).str.strip() == "")
-    ndr_mask = (df["CN_Current_Status"] == "Ware house Destination") & ndr_blank
+    ndr_mask = (df["CN_Current_Status"].astype(str) == "Ware house Destination") & ndr_blank
     ndr_counts = (
         df[ndr_mask].groupby(["BKG_Zone", "Week_Label"]).size().unstack(fill_value=0)
-        .reindex(index=zones, columns=weeks, fill_value=0)
-        .astype(int)
+        .reindex(index=zones, columns=weeks, fill_value=0).astype(int)
     )
 
-    # Status cube
     status_counts = df.groupby(["BKG_Zone", "CN_Current_Status", "Week_Label"]).size().unstack(fill_value=0)
     status_counts = status_counts.reindex(
         pd.MultiIndex.from_product([zones, all_statuses], names=["BKG_Zone", "CN_Current_Status"]),
@@ -149,7 +210,6 @@ def _build_summary_fast(df):
     idx: List[str] = []
     rows: List[List[object]] = []
 
-    # Picked Volume
     idx.append("Picked Volume")
     rows.append(weekly_total.values.tolist())
 
@@ -158,12 +218,10 @@ def _build_summary_fast(df):
     for zone in zones:
         zc = zone_counts.loc[zone].values.astype(int)
 
-        # Picked Vol Zone %
         pct = np.where(wt != 0, (zc / wt) * 100.0, 0.0)
         idx.append(f"Picked Vol. Zone {zone} %")
         rows.append([_format_percent_count(p, c) for p, c in zip(pct, zc)])
 
-        # BUSINESS TYPE BREAKDOWN header
         idx.append(f"BUSINESS TYPE BREAKDOWN__{zone}")
         rows.append(["" for _ in weeks])
 
@@ -174,10 +232,8 @@ def _build_summary_fast(df):
             idx.append(f"   {bt}__{zone}")
             rows.append([_format_percent_count(p, c) for p, c in zip(pct, bc)])
 
-        # TPTR Mode blocks
         for mode in all_modes:
             mc = mode_counts.loc[(zone, mode)].values.astype(int)
-
             denom = zc.astype(float)
             pct = np.where(denom != 0, (mc / denom) * 100.0, 0.0)
             idx.append(f"TPTR Mode {mode}__{zone}")
@@ -195,14 +251,12 @@ def _build_summary_fast(df):
             idx.append(f"{mode} On Time Delivery__{zone}")
             rows.append([_format_percent_count(p, c) for p, c in zip(pct, dc)])
 
-        # NDR not available
         nc = ndr_counts.loc[zone].values.astype(int)
         denom = zc.astype(float)
         pct = np.where(denom != 0, (nc / denom) * 100.0, 0.0)
         idx.append(f"NDR not available__{zone}")
         rows.append([_format_percent_count(p, c) for p, c in zip(pct, nc)])
 
-        # CN Status Breakdown header
         idx.append(f"CN Status Breakdown__{zone}")
         rows.append(["" for _ in weeks])
 
@@ -214,13 +268,11 @@ def _build_summary_fast(df):
             rows.append([_format_percent_count(p, c) for p, c in zip(pct, sc)])
 
     summary = pd.DataFrame(rows, index=idx, columns=weeks)
-    # Clean labels like original
     summary.index = summary.index.to_series().astype(str).str.replace(r"__(.*)$", "", regex=True).values
     return summary
 
 
 def _apply_row_grouping(ws) -> None:
-    """Your original grouping logic, optimized (cache column A reads)."""
     max_row = ws.max_row
     colA = [None] + [ws.cell(row=r, column=1).value for r in range(1, max_row + 1)]
 
@@ -252,7 +304,6 @@ def _apply_row_grouping(ws) -> None:
                 if txt == "BUSINESS TYPE BREAKDOWN":
                     ws.row_dimensions[sub].outline_level = 2
                     ws.row_dimensions[sub].collapsed = True
-
                     s = sub + 1
                     e = s
                     while e <= zone_end and isinstance(colA[e], str) and str(colA[e]).startswith("   "):
@@ -265,7 +316,6 @@ def _apply_row_grouping(ws) -> None:
                 if isinstance(txt, str) and str(txt).startswith("TPTR Mode"):
                     ws.row_dimensions[sub].outline_level = 2
                     ws.row_dimensions[sub].collapsed = True
-
                     s = sub + 1
                     e = s
                     while e <= zone_end and not (
@@ -286,7 +336,6 @@ def _apply_row_grouping(ws) -> None:
                 if txt == "CN Status Breakdown":
                     ws.row_dimensions[sub].outline_level = 2
                     ws.row_dimensions[sub].collapsed = True
-
                     s = sub + 1
                     e = s
                     while e <= zone_end and isinstance(colA[e], str) and str(colA[e]).startswith("   "):
@@ -304,10 +353,6 @@ def _apply_row_grouping(ws) -> None:
 
 
 def _format_summary_sheet(ws) -> None:
-    """Same formatting as your original code."""
-    if not _ensure_deps():
-        st.stop()
-
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(color="FFFFFF", bold=True)
     bold_font = Font(bold=True)
@@ -339,10 +384,8 @@ def _format_summary_sheet(ws) -> None:
             cell.border = border
             cell.alignment = center
 
-    start_row = 2
-    start_col = 2
-    end_row = ws.max_row
-    end_col = ws.max_column
+    start_row, start_col = 2, 2
+    end_row, end_col = ws.max_row, ws.max_column
     rng = f"{ws.cell(start_row, start_col).coordinate}:{ws.cell(end_row, end_col).coordinate}"
 
     rule = ColorScaleRule(
@@ -358,27 +401,29 @@ def _format_summary_sheet(ws) -> None:
 
 
 # ============================================================
-# ✅ PROCESSOR (OPTIMIZED)
+# ✅ PROCESSOR (SAFE MODES)
 # ============================================================
 def process_edd_report(
     input_path: str,
-    output_path: Optional[str] = None,
+    output_path: str,
     source_sheet: str = "Query result",
     summary_sheet: str = "summary",
+    output_mode: str = "summary_only",  # "summary_only" or "full_file"
+    apply_grouping: bool = True,
     apply_formatting: bool = True,
 ) -> str:
+    """
+    output_mode:
+      - summary_only: creates a SMALL output Excel with only summary (best for Streamlit Cloud)
+      - full_file: copies original workbook + adds summary (may crash for huge files)
+    """
     if not _ensure_deps():
         st.stop()
 
-    if output_path is None:
-        file_path = input_path
-    else:
-        shutil.copyfile(input_path, output_path)
-        file_path = output_path
+    # 1) Read only required columns (fast + low RAM)
+    df = _read_required_columns_excel(input_path, source_sheet)
 
-    df = pd.read_excel(file_path, sheet_name=source_sheet)
-    df.columns = df.columns.str.strip()
-
+    # 2) Dates
     date_cols = ["EDD_Date", "PICKUP_CHLN_DATE", "Reached At Destination", "DLY_Date"]
     for col in date_cols:
         if col in df.columns:
@@ -386,45 +431,55 @@ def process_edd_report(
 
     df = df.dropna(subset=["EDD_Date"])
 
+    # 3) Compute NEW_EDD_DATE + flags (use booleans to reduce RAM)
+    df["TAT_DAYS"] = pd.to_numeric(df["TAT_DAYS"], errors="coerce")
+
     df["NEW_EDD_DATE"] = df["PICKUP_CHLN_DATE"] + pd.to_timedelta(df["TAT_DAYS"] - 1, unit="D")
 
-    df["ON_TIME_ARRIVAL"] = "No"
-    valid_arrival = (
-        df["Reached At Destination"].notna()
-        & df["EDD_Date"].notna()
-        & df["NEW_EDD_DATE"].notna()
-    )
-    cond1 = df["Reached At Destination"] <= df["NEW_EDD_DATE"]
-    cond2 = (
-        (df["Reached At Destination"].dt.date == df["EDD_Date"].dt.date)
-        & (df["Reached At Destination"].dt.time < time(12, 0))
-    )
-    df.loc[valid_arrival & (cond1 | cond2), "ON_TIME_ARRIVAL"] = "Yes"
+    reached = df["Reached At Destination"]
+    edd = df["EDD_Date"]
 
-    df["ON_TIME_DELIVERY"] = "No"
-    df.loc[
-        df["DLY_Date"].notna()
-        & df["EDD_Date"].notna()
-        & (df["DLY_Date"] <= df["EDD_Date"]),
-        "ON_TIME_DELIVERY",
-    ] = "Yes"
+    valid_arrival = reached.notna() & edd.notna() & df["NEW_EDD_DATE"].notna()
+
+    cond1 = reached <= df["NEW_EDD_DATE"]
+    cond2 = (reached.dt.normalize() == edd.dt.normalize()) & (reached.dt.hour < 12)
+
+    df["ON_TIME_ARRIVAL"] = valid_arrival & (cond1 | cond2)
+
+    df["ON_TIME_DELIVERY"] = df["DLY_Date"].notna() & edd.notna() & (df["DLY_Date"] <= edd)
 
     df["Week_Label"] = "W-" + df["EDD_Date"].dt.isocalendar().week.astype(int).astype(str)
 
+    # 4) Build summary (fast)
     summary = _build_summary_fast(df)
 
-    with pd.ExcelWriter(file_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    # 5) Write output
+    if output_mode == "summary_only":
+        # Small file => safe (recommended)
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            summary.to_excel(writer, sheet_name=summary_sheet)
+            ws = writer.sheets[summary_sheet]
+            if apply_grouping:
+                _apply_row_grouping(ws)
+            if apply_formatting:
+                _format_summary_sheet(ws)
+        return output_path
+
+    # full_file mode (copy workbook then append summary)
+    shutil.copyfile(input_path, output_path)
+    with pd.ExcelWriter(output_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
         summary.to_excel(writer, sheet_name=summary_sheet)
         ws = writer.sheets[summary_sheet]
-        _apply_row_grouping(ws)
+        if apply_grouping:
+            _apply_row_grouping(ws)
         if apply_formatting:
             _format_summary_sheet(ws)
 
-    return file_path
+    return output_path
 
 
 # ============================================================
-# ✅ OpenAI helpers (lazy import = no startup crash)
+# ✅ OpenAI (optional; keep app stable if openai missing)
 # ============================================================
 def get_openai_key() -> Optional[str]:
     key = None
@@ -442,53 +497,28 @@ def get_openai_key() -> Optional[str]:
 def make_client() -> Tuple[Optional[object], Optional[str]]:
     key = get_openai_key()
     if not key:
-        return None, "OpenAI key missing (add in Streamlit Secrets or sidebar)."
-
+        return None, "OpenAI key missing."
     try:
-        from openai import OpenAI  # imported lazily
+        from openai import OpenAI  # lazy import
         return OpenAI(api_key=key), None
     except Exception as e:
-        return None, f"OpenAI SDK import/init failed: {e}"
+        return None, f"OpenAI SDK failed: {e}"
 
 
 def llm_answer(client: object, model: str, system: str, user: str) -> str:
-    last_err: Optional[Exception] = None
-
-    # Responses API
-    if hasattr(client, "responses"):
-        try:
-            resp = client.responses.create(
-                model=model,
-                instructions=system,
-                input=user,
-            )
-            out = getattr(resp, "output_text", None)
-            if out:
-                return out.strip()
-            return str(resp)
-        except Exception as e:
-            last_err = e
-
-    # Chat Completions
-    if hasattr(client, "chat") and hasattr(getattr(client, "chat"), "completions"):
-        try:
-            comp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.2,
-            )
-            return (comp.choices[0].message.content or "").strip()
-        except Exception as e:
-            last_err = e
-
-    return f"❌ OpenAI error: {last_err}" if last_err else "❌ OpenAI client not available."
+    try:
+        resp = client.responses.create(
+            model=model,
+            instructions=system,
+            input=user,
+        )
+        return (resp.output_text or "").strip()
+    except Exception as e:
+        return f"❌ OpenAI error: {e}"
 
 
 # ============================================================
-# ✅ Summary Q&A helpers (unchanged)
+# ✅ Summary Q&A helpers (same as before)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_summary_df(xlsx_bytes: bytes, sheet: str = "summary"):
@@ -507,19 +537,15 @@ def _normalize_week_label(week_num: int) -> str:
 
 def extract_week(question: str) -> Optional[str]:
     q = (question or "").strip()
-
     m = re.search(r"\bW\s*[-_ ]\s*(\d{1,2})\b", q, flags=re.IGNORECASE)
     if m:
         return _normalize_week_label(int(m.group(1)))
-
     m = re.search(r"\bweek\s*[-_ ]*\s*(\d{1,2})\b", q, flags=re.IGNORECASE)
     if m:
         return _normalize_week_label(int(m.group(1)))
-
     m = re.search(r"\bweek(\d{1,2})\b", q, flags=re.IGNORECASE)
     if m:
         return _normalize_week_label(int(m.group(1)))
-
     return None
 
 
@@ -549,16 +575,12 @@ def select_relevant_rows(question: str, summary_df) -> List[str]:
     metrics = summary_df[metric_col].astype(str).tolist()
 
     hits = []
-
     if "picked" in q and "volume" in q and "Picked Volume" in metrics:
         hits.append("Picked Volume")
-
-    if "cn" in q and ("status" in q or "current" in q) and "CN Status Breakdown" in metrics:
-        hits.append("CN Status Breakdown")
-
     if "ndr" in q and "NDR not available" in metrics:
         hits.append("NDR not available")
-
+    if "cn" in q and ("status" in q or "current" in q) and "CN Status Breakdown" in metrics:
+        hits.append("CN Status Breakdown")
     if ("business" in q or "retail" in q or "scm" in q) and "BUSINESS TYPE BREAKDOWN" in metrics:
         hits.append("BUSINESS TYPE BREAKDOWN")
 
@@ -592,7 +614,6 @@ def select_relevant_rows(question: str, summary_df) -> List[str]:
 def answer_from_summary(summary_df, question: str) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]]]:
     if summary_df.empty:
         return None, None, []
-
     metric_col = "Metric" if "Metric" in summary_df.columns else summary_df.columns[0]
 
     zones = zones_from_summary(summary_df)
@@ -639,11 +660,9 @@ st.caption("Upload Excel → (1) View Summary  (2) Ask Questions  (3) Process Un
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("If you still see 'Oh no', most likely requirements.txt is missing numpy/openpyxl.")
     model = st.selectbox("Model", options=["gpt-4o-mini", "gpt-4o"], index=0)
 
     st.markdown("### 🔑 OpenAI Secret Key")
-    st.caption("Preferred: Streamlit Secrets → OPENAI_API_KEY")
     key_in = st.text_input("Paste key (sk-...)", type="password")
     if key_in:
         st.session_state["_openai_key"] = key_in
@@ -655,9 +674,8 @@ with tabs[0]:
     if not uploaded:
         st.info("Upload a processed Excel first (jisme summary sheet already ho).")
     else:
-        xbytes = uploaded.getvalue()
         try:
-            sdf = load_summary_df(xbytes, sheet="summary")
+            sdf = load_summary_df(uploaded.getvalue(), sheet="summary")
             st.subheader("Summary Sheet")
             st.dataframe(sdf, use_container_width=True, height=600)
         except Exception as e:
@@ -668,13 +686,12 @@ with tabs[1]:
     if not uploaded:
         st.info("Pehle Excel upload karo.")
     else:
-        xbytes = uploaded.getvalue()
         try:
-            summary_df = load_summary_df(xbytes, sheet="summary")
+            summary_df = load_summary_df(uploaded.getvalue(), sheet="summary")
         except Exception as e:
             st.error(f"Summary sheet read nahi ho paayi: {e}")
             st.code(traceback.format_exc())
-            summary_df = pd.DataFrame() if _ensure_deps() else None
+            summary_df = None
 
         st.subheader("Ask Questions (Anything from Summary)")
         q = st.text_input(
@@ -685,9 +702,8 @@ with tabs[1]:
 
         if ask and q.strip() and summary_df is not None:
             week, zone, items = answer_from_summary(summary_df, q)
-
             if not items:
-                st.error("Week/metric match nahi hua. Example: 'week-48 picked volume', 'Week 51 ALL INDIA CN current status'")
+                st.error("Week/metric match nahi hua.")
             else:
                 client, cerr = make_client()
                 context_lines = "\n".join([f"- {m}: {v}" for m, v in items])
@@ -702,13 +718,10 @@ Give a short, direct answer. Do NOT show JSON or code. If multiple rows, format 
                         ans = llm_answer(
                             client=client,
                             model=model,
-                            system="You are a logistics MIS analyst. Answer only from the provided Excel summary context. If info missing, say what is missing.",
+                            system="You are a logistics MIS analyst. Answer only from provided context.",
                             user=prompt,
                         )
-                    if ans.strip().startswith("❌"):
-                        st.error(ans)
-                    else:
-                        st.success(ans)
+                    st.success(ans)
                 else:
                     if cerr:
                         st.warning(cerr)
@@ -716,39 +729,62 @@ Give a short, direct answer. Do NOT show JSON or code. If multiple rows, format 
 
 with tabs[2]:
     st.subheader("Process Unprocessed File → Generate Summary")
-    st.write("Yahan tum apna backend processing (pandas+openpyxl) run kara sakte ho.")
     unp = st.file_uploader("Upload Unprocessed Excel (.xlsx)", type=["xlsx"], key="unprocessed_upload")
 
     if unp:
-        fast_mode = st.checkbox("⚡ Fast mode (skip formatting)", value=False)
+        file_bytes = unp.getvalue()
+        size_mb = len(file_bytes) / (1024 * 1024)
+        st.caption(f"📦 Uploaded file size: **{size_mb:.1f} MB**")
+
+        # Default: Summary only (safe on Streamlit Cloud)
+        output_mode = st.selectbox(
+            "Output mode",
+            ["Summary only (FAST, recommended)", "Full file (add summary to original)"],
+            index=0,
+        )
+
+        apply_grouping = st.checkbox("Apply row grouping", value=True)
+        apply_formatting = st.checkbox("Apply conditional formatting (slow)", value=False)
+
+        if size_mb >= 25 and output_mode.startswith("Full file"):
+            st.warning("⚠️ Large file + Full file mode can crash Streamlit Cloud. Prefer Summary only.")
 
         if st.button("Run Processing"):
-            with st.spinner("Processing... (summary + grouping + formatting)"):
+            with st.spinner("Processing..."):
                 with tempfile.TemporaryDirectory() as td:
                     in_path = os.path.join(td, "input.xlsx")
-                    out_path = os.path.join(td, "EDD_Report_Processed.xlsx")
                     with open(in_path, "wb") as f:
-                        f.write(unp.getvalue())
+                        f.write(file_bytes)
+
+                    # Output paths
+                    summary_only_path = os.path.join(td, "EDD_Summary_Processed.xlsx")
+                    full_path = os.path.join(td, "EDD_Report_Processed.xlsx")
 
                     try:
+                        mode = "summary_only" if output_mode.startswith("Summary only") else "full_file"
+                        out_path = summary_only_path if mode == "summary_only" else full_path
+
                         process_edd_report(
                             input_path=in_path,
                             output_path=out_path,
                             source_sheet="Query result",
                             summary_sheet="summary",
-                            apply_formatting=(not fast_mode),
+                            output_mode=mode,
+                            apply_grouping=apply_grouping,
+                            apply_formatting=apply_formatting,
                         )
 
                         with open(out_path, "rb") as f:
                             out_bytes = f.read()
 
-                        st.success("✅ Processing done! Download processed file below.")
+                        st.success("✅ Processing done! Download below.")
                         st.download_button(
                             "⬇️ Download Processed Excel",
                             data=out_bytes,
-                            file_name="EDD_Report_Processed.xlsx",
+                            file_name=os.path.basename(out_path),
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
+
                     except Exception as e:
                         st.error(f"Processing failed: {e}")
                         st.code(traceback.format_exc())
