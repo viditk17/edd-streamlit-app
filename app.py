@@ -11,7 +11,21 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.formatting.rule import ColorScaleRule
-from openai import OpenAI
+
+# =============================================================================
+# ✅ OPENAI SDK (ROBUST IMPORT: works with new + legacy, avoids Streamlit crash)
+# =============================================================================
+# - New SDK (recommended): openai>=1.x => from openai import OpenAI
+# - Legacy SDK: openai==0.28.1 => import openai; openai.ChatCompletion.create
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
+
+try:
+    import openai as openai_legacy  # type: ignore
+except Exception:
+    openai_legacy = None  # type: ignore
 
 
 # =============================================================================
@@ -423,8 +437,7 @@ def _format_summary_sheet(file_path: str, summary_sheet: str = "summary") -> Non
             cell.border = border
             cell.alignment = center
 
-    # --- Conditional Formatting (optional nice view) ---
-    # Apply to % values area (B2:last)
+    # --- Conditional Formatting ---
     start_row = 2
     start_col = 2
     end_row = ws.max_row
@@ -446,7 +459,7 @@ def _format_summary_sheet(file_path: str, summary_sheet: str = "summary") -> Non
 
 
 # =============================================================================
-# ✅ OPENAI + STREAMLIT (CHAT + PROCESS)
+# ✅ OPENAI + STREAMLIT (CHAT + PROCESS) — FIXED (NO CRASH ON CLOUD)
 # =============================================================================
 
 def get_openai_key() -> Optional[str]:
@@ -463,37 +476,83 @@ def get_openai_key() -> Optional[str]:
     return key
 
 
-def make_client() -> Optional[OpenAI]:
+def make_client() -> Optional[object]:
+    """
+    Returns:
+      - OpenAI(api_key=...) client if new SDK available
+      - openai_legacy module if legacy SDK available
+      - None if no key or no SDK installed
+    """
     key = get_openai_key()
     if not key:
         return None
-    return OpenAI(api_key=key)
+
+    if OpenAI is not None:
+        return OpenAI(api_key=key)
+
+    if openai_legacy is not None and hasattr(openai_legacy, "ChatCompletion"):
+        openai_legacy.api_key = key
+        return openai_legacy
+
+    return None
 
 
-def llm_answer(client: OpenAI, model: str, system: str, user: str) -> str:
-    # Works on both new "Responses API" SDK and older "Chat Completions" SDK.
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        out = getattr(resp, "output_text", None)
-        if out:
-            return out.strip()
-        return str(resp)
-    except Exception:
-        comp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        return (comp.choices[0].message.content or "").strip()
+def llm_answer(client: object, model: str, system: str, user: str) -> str:
+    """
+    - New SDK: prefers Responses API w/ instructions=system, input=user
+    - Fallback: Chat Completions
+    - Legacy SDK fallback: openai.ChatCompletion.create
+    Never raises (won't crash Streamlit); returns a readable error string on failure.
+    """
+    last_err: Optional[Exception] = None
+
+    # ---- New SDK: Responses API ----
+    if hasattr(client, "responses"):
+        try:
+            resp = client.responses.create(
+                model=model,
+                instructions=system,
+                input=user,
+            )
+            out = getattr(resp, "output_text", None)
+            if out:
+                return out.strip()
+            return str(resp)
+        except Exception as e:
+            last_err = e
+
+    # ---- New SDK: Chat Completions ----
+    if hasattr(client, "chat") and hasattr(getattr(client, "chat"), "completions"):
+        try:
+            comp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+            )
+            return (comp.choices[0].message.content or "").strip()
+        except Exception as e:
+            last_err = e
+
+    # ---- Legacy SDK: ChatCompletion ----
+    if hasattr(client, "ChatCompletion"):
+        try:
+            comp = client.ChatCompletion.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+            )
+            # legacy returns dict-like
+            return (comp["choices"][0]["message"]["content"] or "").strip()
+        except Exception as e:
+            last_err = e
+
+    return f"❌ OpenAI call failed: {last_err}" if last_err else "❌ OpenAI client not available."
 
 
 @st.cache_data(show_spinner=False)
@@ -590,7 +649,11 @@ def select_relevant_rows(question: str, summary_df: pd.DataFrame) -> List[str]:
     # fallback keyword matching
     if not hits:
         tokens = [t for t in re.findall(r"[a-zA-Z0-9]+", q) if len(t) > 2]
-        stop = {"the", "and", "with", "from", "this", "that", "mein", "me", "ka", "ki", "ke", "for", "show", "dikhao", "bata", "batao", "please"}
+        stop = {
+            "the", "and", "with", "from", "this", "that",
+            "mein", "me", "ka", "ki", "ke", "for",
+            "show", "dikhao", "bata", "batao", "please"
+        }
         tokens = [t for t in tokens if t not in stop]
         for m in metrics:
             mm = m.lower()
@@ -606,7 +669,9 @@ def select_relevant_rows(question: str, summary_df: pd.DataFrame) -> List[str]:
     return out
 
 
-def answer_from_summary(summary_df: pd.DataFrame, question: str) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]]]:
+def answer_from_summary(
+    summary_df: pd.DataFrame, question: str
+) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]]]:
     if summary_df.empty:
         return None, None, []
 
@@ -616,7 +681,10 @@ def answer_from_summary(summary_df: pd.DataFrame, question: str) -> Tuple[Option
     week = extract_week(question)
 
     # If week missing, use latest available week col
-    week_cols = [c for c in summary_df.columns if isinstance(c, str) and re.match(r"^W-\d{1,2}$", c.strip())]
+    week_cols = [
+        c for c in summary_df.columns
+        if isinstance(c, str) and re.match(r"^W-\d{1,2}$", c.strip())
+    ]
     if not week and week_cols:
         week = sorted(week_cols, key=lambda x: int(x.split("-")[1]))[-1]
 
@@ -642,7 +710,11 @@ def answer_from_summary(summary_df: pd.DataFrame, question: str) -> Tuple[Option
             if start_idx is not None:
                 for i in range(start_idx + 1, min(start_idx + 20, len(summary_df))):
                     mname = str(summary_df.iloc[i][metric_col])
-                    if mname in ("BUSINESS TYPE BREAKDOWN", "CN Status Breakdown") or mname.startswith("TPTR Mode") or mname.startswith("Picked Vol. Zone"):
+                    if (
+                        mname in ("BUSINESS TYPE BREAKDOWN", "CN Status Breakdown")
+                        or mname.startswith("TPTR Mode")
+                        or mname.startswith("Picked Vol. Zone")
+                    ):
                         break
                     v = summary_df.iloc[i][week]
                     result.append((mname, "" if pd.isna(v) else str(v)))
@@ -730,7 +802,10 @@ Give a short, direct answer. Do NOT show JSON or code. If multiple rows, format 
                             system="You are a logistics MIS analyst. Answer only from the provided Excel summary context. If info missing, say what is missing.",
                             user=prompt,
                         )
-                    st.success(ans)
+                    if ans.strip().startswith("❌"):
+                        st.error(ans)
+                    else:
+                        st.success(ans)
                 else:
                     st.success("\n".join([f"• {m}: {v}" for m, v in items]))
 
