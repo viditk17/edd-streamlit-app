@@ -1,4 +1,5 @@
-flask
+streamlit
 pandas
+numpy
 openpyxl
-xlsxwriter
+openai
