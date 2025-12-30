@@ -3,3 +3,7 @@ pandas
 numpy
 openpyxl
 openai
+nbformat
+nbconvert
+ipykernel
+jupyter_client
